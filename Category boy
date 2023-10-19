@@ -1,0 +1,114 @@
+import pandas as pd
+from sshtunnel import SSHTunnelForwarder
+import numpy as np
+#import psycopg2
+import clickhouse_connect
+import requests
+import telebot
+from tqdm import tqdm 
+from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime
+from sshtunnel import SSHTunnelForwarder
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime
+import telegram
+
+# Замените на путь к файлу JSON с учетными данными вашего сервисного аккаунта
+credentials_path = 'C:\\Import db gs\\credent.json'
+
+# Устанавливаем область доступа
+scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+
+# Аутентификация в Google Таблицах
+credentials = ServiceAccountCredentials.from_json_keyfile_name(credentials_path, scope)
+gc = gspread.authorize(credentials)
+
+# Открываем таблицу по её ID
+spreadsheet_id = '18ou_zDIYy4l_sNYHRxnnl5dEHP8fCGJEau9w4l9WiPs'
+worksheet = gc.open_by_key(spreadsheet_id).sheet1
+
+
+sheet = gc.open('Группировка товаров').sheet1
+# Загрузите данные из Google Таблицы в DataFrame
+df_google = pd.DataFrame(sheet.get_all_records())
+
+import telebot
+
+# Our Telegram Bot Token.
+bot_token = "6499513861:AAEnzGq0K5ZuB7W9t_kspfS6j01NfcPGS0I"
+# Инициализация бота
+bot = telebot.TeleBot(bot_token)
+
+
+@bot.message_handler(commands=['start'])
+def handle_start(message):
+    bot.send_message(message.chat.id, "Привет! Введите или отсканируйте штрих код, чтобы узнать его категорию.")
+    
+@bot.message_handler(func=lambda message: True)
+
+
+def handle_text(message):
+    try:
+        order_number = message.text  # Сохраняем текст сообщения пользователя в переменной order_number
+        query = f'''
+        select category_id
+        from extended_order_items
+            left join sku_dict on extended_order_items.sku_id = sku_dict.id
+        where barcode = '{order_number}'
+        limit 1
+        '''
+        
+        ssh_tunnel = SSHTunnelForwarder(
+            ('130.193.53.66', 22),
+            ssh_username="bakhadir_muradov",
+            ssh_pkey="C:/Users/Dell/.ssh/id_rsa",
+            ssh_private_key_password="Baxa",
+            remote_bind_address=('rc1b-na27sogivsn3rd79.mdb.yandexcloud.net', 8123)
+        )
+
+        ssh_tunnel.start()
+
+        client = clickhouse_connect.get_client(host='localhost',
+                                           user='sa-bot',
+                                           password='5o%*SxzF98Oc8%1R',
+                                           port=ssh_tunnel.local_bind_port,
+                                           database='marts')
+
+        df_temp = pd.DataFrame(client.query_df(query))
+
+ 
+    # Объедините данные из Google Таблицы и результаты SQL-запроса
+        merged_df = pd.merge(df_temp, df_google, left_on='category_id', right_on='id', how='left')
+
+        merged_df['category_id'] = merged_df['id']
+        display(merged_df)
+        user_id = message.from_user.id
+        user_name = message.from_user.username
+        message_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        order = message.text
+        answer = merged_df['status'].to_string(index=False)
+        worksheet.append_row([user_id, user_name, message_time, order, answer])
+
+        bot.send_message(message.chat.id, f"Категория товара с штрих кодом {order_number}: {merged_df['status'].to_string(index=False)}")
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"Произошла ошибка, если указано 'category_id' это обычный товар: {str(e)}")
+    finally:
+        if client is not None:
+            client.close()
+            # Словарь для отслеживания состояния пользователя (ожидание номера заказа или нет)
+user_state = {}
+
+# Функция для проверки, является ли сообщение номером заказа
+def is_order_number(text):
+    try:
+        order_number = int(text)
+        return True
+    except ValueError:
+        return False
+
+
+
+if __name__ == "__main__":
+    bot.polling()
